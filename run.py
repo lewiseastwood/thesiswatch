@@ -1,0 +1,75 @@
+"""Run ThesisWatch against Adobe's two most recent 10-Q filings.
+
+    python run.py
+
+Analyst-support tool. Does not produce buy/sell recommendations.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import anthropic
+import yaml
+from dotenv import load_dotenv
+
+import thesiswatch
+from thesiswatch import THESIS_YAML, Context, Edgar, build_report, evaluate_claim
+
+TICKER = "ADBE"
+FORM = "10-Q"
+OUT = Path(__file__).parent / "report.md"
+
+
+def main() -> int:
+    load_dotenv()
+
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key or api_key.startswith("sk-ant-REPLACE_ME"):
+        print("ANTHROPIC_API_KEY is missing. Add a real key to .env.", file=sys.stderr)
+        return 1
+
+    email = os.getenv("SEC_UA_EMAIL", "").strip()
+    if not email:
+        print("SEC_UA_EMAIL is missing. EDGAR rejects requests without a contact "
+              "address. Add it to .env.", file=sys.stderr)
+        return 1
+
+    thesiswatch.SEC_UA = f"ThesisWatch research/0.1 ({email})"
+    thesiswatch.MODEL = os.getenv("THESISWATCH_MODEL", "").strip() or thesiswatch.MODEL
+
+    edgar = Edgar(thesiswatch.SEC_UA)
+    cik = edgar.cik(TICKER)
+    filings = edgar.filings(cik, FORM, limit=2)
+    if len(filings) < 2:
+        print(f"Need two {FORM} filings to diff; EDGAR returned {len(filings)} "
+              f"for {TICKER}.", file=sys.stderr)
+        return 1
+
+    current, prior = filings[0], filings[1]
+    print(f"{TICKER} CIK {cik}")
+    print(f"  current: {FORM} filed {current['filingDate']} (period {current['reportDate']})")
+    print(f"  prior:   {FORM} filed {prior['filingDate']} (period {prior['reportDate']})")
+
+    print("Downloading and sectioning filings…")
+    ctx = Context(edgar, cik, current, prior)
+    for which, sections in ctx.sections.items():
+        print(f"  {which}: {sorted(sections)}")
+
+    thesis = yaml.safe_load(THESIS_YAML)
+    client = anthropic.Anthropic(api_key=api_key)
+
+    verdicts = []
+    for claim in thesis["claims"]:
+        print(f"Evaluating {claim['id']} with {thesiswatch.MODEL}…")
+        v = evaluate_claim(client, ctx, claim)
+        print(f"  {v.verdict} (confidence {v.confidence}, {v.tool_calls} tool calls)")
+        verdicts.append(v)
+
+    OUT.write_text(build_report(ctx, thesis, verdicts))
+    print(f"Wrote {OUT}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
