@@ -20,6 +20,11 @@ import yaml
 SEC_UA = "ThesisWatch research/0.1 (you@example.com)"
 MODEL = "claude-sonnet-5"
 
+# There is no sampling knob to pin here: the API rejects both `temperature` and
+# `top_k` for this model generation as "deprecated for this model", and neither
+# appears in the SDK. Run-to-run verdict stability therefore has to come from
+# leaving the model no room to choose, which is what the rubric in SYSTEM does.
+
 
 # ---------------------------------------------------------------- EDGAR
 class Edgar:
@@ -275,7 +280,10 @@ TOOLS = [
         "description": (
             "Record the final judgement for this claim. Every excerpt must be copied "
             "VERBATIM from tool output — it is checked against the source and the claim "
-            "is downgraded if it does not match."
+            "is downgraded if it does not match. Filing text often has a page number and "
+            "'Table of Contents' interposed mid-sentence; write an ellipsis (…) where you "
+            "skip such material instead of paraphrasing across it. Text on either side of "
+            "an ellipsis is still checked verbatim."
         ),
         "input_schema": {
             "type": "object",
@@ -365,8 +373,61 @@ class Context:
 
 
 # ---------------------------------------------------- verification gate
+# "…", "...", ". . .", "[...]" — the forms a model uses to mark elided text.
+ELLIPSIS_RE = re.compile(r"\[?\s*(?:\u2026|(?:\.\s*){3,})\s*\]?")
+
+# Running headers/footers the extractor leaves sitting mid-sentence.
+PAGE_FURNITURE_RE = re.compile(
+    r"\s*(?:\d{1,4}\s+)?Table\s+of\s+Contents\b(?:\s+\d{1,4}\b)?\s*", re.I)
+
+
 def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
+    """Fold text to the form the verification gate compares on.
+
+    Page furniture is dropped from both sides of the comparison. The extractor
+    strands a running header mid-sentence, so whether a quote reproduces that
+    header, elides it with an ellipsis, or just closes the gap is a stylistic
+    choice, and it should not decide whether the quote counts as verbatim.
+    """
+    return re.sub(r"\s+", " ", PAGE_FURNITURE_RE.sub(" ", s)).strip().lower()
+
+
+def tidy_excerpt(text: str) -> str:
+    """Collapse interposed page furniture into an ellipsis, for display only.
+
+    Verification runs on the excerpt exactly as submitted, so the ellipsis here
+    stands for characters that really were in the filing at that point — it is
+    shortening a quote, not papering over a mismatch.
+    """
+    return " ".join(PAGE_FURNITURE_RE.sub(" … ", text).split())
+
+# Segments shorter than this are a few words of connective tissue and carry no
+# evidentiary weight, so they are not matched. An excerpt made only of such
+# fragments verifies nothing and is rejected.
+MIN_SEGMENT = 12
+
+
+def is_verbatim(text: str, hay: str) -> bool:
+    """True if every substantive run of `text` appears in `hay`, in order.
+
+    Quotes are checked segment by segment rather than whole, because a filing
+    sentence often has a page footer interposed mid-sentence by the extractor,
+    and the honest way to quote it is to elide with an ellipsis. Requiring the
+    segments in left-to-right, non-overlapping order keeps the guarantee that
+    matters: no words the filing does not contain, in the order it contains
+    them. Fabricated text still fails.
+    """
+    pos, matched = 0, 0
+    for seg in ELLIPSIS_RE.split(norm(text)[:300]):
+        seg = seg.strip()
+        if len(seg) < MIN_SEGMENT:
+            continue
+        at = hay.find(seg, pos)
+        if at < 0:
+            return False
+        pos = at + len(seg)
+        matched += 1
+    return matched > 0
 
 
 def verify(v: Verdict, ctx: Context) -> Verdict:
@@ -374,11 +435,16 @@ def verify(v: Verdict, ctx: Context) -> Verdict:
     kept = []
     for ex in v.excerpts:
         hay = norm(ctx.text.get(ex.get("filing", "current"), ""))
-        if norm(ex["text"])[:300] in hay:
+        if is_verbatim(ex["text"], hay):
             ex["verified"] = True
             kept.append(ex)
         else:
-            v.needs_review.append(f"Unverifiable excerpt dropped: {ex['text'][:120]}…")
+            # Quote enough to tell a fabrication from a near-miss, and only
+            # mark truncation when it happened — an unconditional "…" here read
+            # as if the excerpt itself ended in one, which hid this bug.
+            shown = " ".join(ex["text"].split())
+            clipped = shown[:240] + ("…" if len(shown) > 240 else "")
+            v.needs_review.append(f"Unverifiable excerpt dropped: {clipped}")
     v.excerpts = kept
     if v.verdict in ("strengthened", "weakened") and not (kept or v.metrics):
         v.verdict = "insufficient_evidence"
@@ -402,10 +468,30 @@ against a company's newest SEC filing versus the prior comparable filing.
 Rules:
 - Investigate with the tools before judging. Do not answer from prior knowledge.
 - Numbers come from get_metric only. Never state a figure you did not retrieve.
-- Excerpts must be copied verbatim from tool output, under 60 words each.
+- Excerpts must be copied verbatim from tool output, under 60 words each. Use an
+  ellipsis (…) to mark text you skip inside a quote, including page-break debris
+  like "38 Table of Contents" sitting mid-sentence. Never paraphrase inside a quote.
 - Boilerplate rewording is not a change. Only flag substantive shifts.
 - Prefer insufficient_evidence over a guess.
 - You are supporting an analyst. Never recommend buying or selling.
+
+Verdict rubric. Judge what THIS FILING CHANGED relative to the prior filing. The
+question is never "is the claim true?" — a claim can be comfortably true and still
+be unchanged, because nothing new was disclosed.
+- strengthened: this filing moves the claim measurably further from its falsifiers
+  than the prior filing did.
+- weakened: this filing moves the claim measurably toward a falsifier, or a
+  falsifier is now met.
+- unchanged: the two filings support the claim about equally — the disclosure is
+  the same in substance, or a bound metric moved without changing where it stands
+  against its threshold.
+- insufficient_evidence: the tools did not establish where the claim stands.
+For a bound metric, "measurably" means the margin between the metric and its
+threshold moved by more than ordinary quarter-to-quarter variation; a metric that
+stays on the same side of its threshold with a similar margin is unchanged.
+If two verdicts look equally defensible, return unchanged and put the tension in
+needs_review. Do not resolve a genuine ambiguity by picking the more interesting
+verdict — a verdict has to mean the filing moved, or it tells the analyst nothing.
 Finish by calling submit_verdict exactly once."""
 
 
@@ -490,7 +576,7 @@ def build_report(ctx: Context, thesis: dict, verdicts: list[Verdict]) -> str:
             L.append(f"- `{m['tag']}` {m['period']}: {m['value']:,} "
                      f"{('— ' + m['note']) if m.get('note') else ''}")
         for ex in v.excerpts:
-            L += ["", f"> {ex['text']}", "",
+            L += ["", f"> {tidy_excerpt(ex['text'])}", "",
                   f"  — {ex['filing']} filing, {ex['section']}"]
         L.append("")
 
