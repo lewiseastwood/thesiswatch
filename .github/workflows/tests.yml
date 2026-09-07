@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Neither suite reaches the network or reads a credential. The gate tests
+      # are pure functions over string fixtures; the dashboard tests render
+      # app.py against hand-built run files with THESES_DIR and RUNS_DIR pointed
+      # at temp dirs, so the thesis binds no XBRL metric and no EDGAR call is
+      # made. A suite that needed an API key could not run here at all, which is
+      # the reason for keeping the fixtures synthetic.
+      - name: Verification gate
+        run: python test_verify.py
+
+      - name: Dashboard rendering invariants
+        run: python test_dashboard.py

@@ -1,0 +1,12 @@
+# Pinned, because two of these have already changed behaviour under this project:
+# anthropic 1.4.0 rejects `temperature` on claude-sonnet-5 (see NOTES.md §1), and
+# streamlit renamed `use_container_width` to `width` mid-development.
+anthropic==1.4.0
+python-dotenv==1.2.3
+pyyaml==6.0.3
+requests==2.34.2
+
+# Dashboard only. The CLI (run.py) needs neither, but test_dashboard.py renders
+# app.py through streamlit's AppTest, so both are required to run the suites.
+plotly==7.0.0
+streamlit==1.63.0
