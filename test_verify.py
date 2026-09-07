@@ -11,12 +11,20 @@ break the second.
 
 import sys
 
-from thesiswatch import is_verbatim, norm
+from thesiswatch import (MAX_SEGMENT_GAP, Verdict, build_report, is_verbatim,
+                         norm, strip_markup, validate_payload, verify)
 
 # Mimics the real extractor output: a running header and page number stranded
 # mid-sentence, which is what broke the gate on Adobe's AI-competition risk
 # factor. Written on one line per paragraph, as to_text() produces.
-FILING = """
+#
+# The filler matters. A composite has to be stitched across a realistic
+# distance for the gap bound to be under any real test, so the risk factor and
+# the MD&A sentence sit thousands of characters apart, as they do in a filing.
+FILLER = ("\nOur results of operations may fluctuate for many reasons, including "
+          "those described elsewhere in this report. " * 40)
+
+FILING = f"""
 Item 1A. Risk Factors
 
 We face increasing competition from companies offering generative and agentic AI
@@ -25,8 +33,21 @@ We face increasing competition from companies offering generative and agentic AI
  Table of Contents
 
  solutions, including but not limited to prompt-based and multi-modal creation and editing, document productivity and understanding, and purpose-built AI agents. Other companies have in the past, and may in the future prevent, limit or interfere with our ability to use third-party models in our solutions.
+{FILLER}
+Item 2. Management's Discussion and Analysis
 
 Total Adobe ARR grew to $27.10 billion at the end of the second quarter of fiscal 2026, representing 12.5% year-over-year growth.
+"""
+
+# Same risk factor, reworded. Used to check that an excerpt labelled `current`
+# is actually checked against the current filing.
+PRIOR_FILING = """
+Item 1A. Risk Factors
+
+We face competition from companies offering generative artificial intelligence
+solutions, and expect that competition to intensify over time.
+
+Total Adobe ARR grew to $24.10 billion at the end of the second quarter of fiscal 2025, representing 11.0% year-over-year growth.
 """
 
 SENTENCE = ("We face increasing competition from companies offering generative "
@@ -65,12 +86,104 @@ DROP = {
     "nothing but connective fragments": "We … AI … is … not … material",
     "a figure the filing does not state": "Total Adobe ARR grew to $31.40 billion at "
                                           "the end of the second quarter of fiscal 2026",
+    # The hole the loosened matcher opened: both halves verbatim, both in order,
+    # but from different Items, together asserting a sentence the filing does
+    # not contain. Order-preservation does not constrain distance.
+    "composite stitched across sections":
+        f"{SENTENCE} … Total Adobe ARR grew to $27.10 billion",
+    "composite reaching backwards across sections":
+        "Total Adobe ARR grew to $27.10 billion … in our solutions",
+    # A figure altered and then isolated by ellipses so it lands under
+    # MIN_SEGMENT. Skipping short segments meant this was never checked at all.
+    "altered figure hidden in a sub-minimum segment":
+        "Total Adobe ARR grew to … 31.40 … year-over-year growth",
+    "altered percentage hidden in a sub-minimum segment":
+        "at the end of the second quarter of fiscal 2026, representing … 41.5% … growth",
 }
+
+
+class StubContext:
+    """Minimal stand-in for Context; verify() only reads .text."""
+
+    def __init__(self):
+        self.text = {"current": FILING, "prior": PRIOR_FILING}
+
+
+PRIOR_ONLY = ("We face competition from companies offering generative artificial "
+              "intelligence solutions, and expect that competition to intensify")
+
+
+def check_labels(failures: list[str]) -> int:
+    """An excerpt is checked against the filing it claims to come from.
+
+    The risk factor is reworded between the two fixtures, so quoting the prior
+    wording while labelling it `current` has to be dropped. Identical
+    boilerplate cannot be told apart this way, which a real run confirmed --
+    every unchanged risk-factor excerpt was present in both filings -- so this
+    only bites when the wording actually moved. That is the case that matters.
+    """
+    cases = [
+        ("prior wording, labelled prior", PRIOR_ONLY, "prior", True),
+        ("prior wording, labelled current", PRIOR_ONLY, "current", False),
+        ("current wording, labelled current", SENTENCE, "current", True),
+        ("current wording, labelled prior", SENTENCE, "prior", False),
+    ]
+    ctx = StubContext()
+    for label, text, filing, should_keep in cases:
+        v = Verdict("TC-01", "s", excerpts=[{"text": text, "section": "risk_factors",
+                                             "filing": filing}])
+        kept = bool(verify(v, ctx).excerpts)
+        if kept != should_keep:
+            failures.append(
+                f"filing label {'dropped' if should_keep else 'kept'} wrongly: {label}")
+    return len(cases)
+
+
+def check_payloads(failures: list[str]) -> int:
+    """A partial or mis-serialized verdict payload must be refused, not rendered.
+
+    The observed failure came back with stop_reason "tool_use" and every key
+    present, while three excerpts had been absorbed into the reasoning string
+    and rendered into the report as raw JSON without the gate ever running.
+    """
+    leaked = ('Growth is healthy.</reasoning>\n<parameter name="excerpts">'
+              '[{"filing":"current","text":"Subscription and support $ 10,820"}]')
+    cases = [
+        ("clean payload accepted",
+         {"verdict": "unchanged", "reasoning": "Growth is healthy."}, "tool_use", False),
+        ("markup in reasoning refused",
+         {"verdict": "unchanged", "reasoning": leaked}, "tool_use", True),
+        ("cap truncation refused even with a clean-looking payload",
+         {"verdict": "unchanged", "reasoning": "Growth is healthy."}, "max_tokens", True),
+    ]
+    for label, payload, stop_reason, should_reject in cases:
+        rejected = bool(validate_payload(Verdict("TC-01", "s"), payload, stop_reason))
+        if rejected != should_reject:
+            failures.append(
+                f"payload {'accepted' if should_reject else 'refused'} wrongly: {label}")
+
+    # Rendering is the last line of defence: leaked markup must never reach the
+    # page, and the claim must be flagged rather than read as clean analysis.
+    v = Verdict("TC-01", "s", verdict="unchanged", reasoning=leaked)
+
+    class C:
+        current = {"form": "10-Q", "filingDate": "d", "accessionNumber": "a",
+                   "index_url": "u", "reportDate": "r"}
+        prior = dict(current)
+
+    report = build_report(C(), {"ticker": "T", "name": "n"}, [v])
+    if "<parameter" in report or "</reasoning>" in report:
+        failures.append("build_report rendered raw tool-call markup")
+    if "Subscription and support $ 10,820" in report:
+        failures.append("build_report rendered an unverified excerpt from leaked markup")
+    if "never verified" not in report:
+        failures.append("build_report did not flag the claim whose reasoning leaked")
+    return len(cases) + 3
 
 
 def main() -> int:
     hay = norm(FILING)
-    failures = []
+    failures: list[str] = []
 
     for label, excerpt in KEEP.items():
         if not is_verbatim(excerpt, hay):
@@ -79,10 +192,11 @@ def main() -> int:
         if is_verbatim(excerpt, hay):
             failures.append(f"should have been dropped, was kept: {label}")
 
-    total = len(KEEP) + len(DROP)
+    total = len(KEEP) + len(DROP) + check_labels(failures) + check_payloads(failures)
     for f in failures:
         print(f"FAIL  {f}")
-    print(f"{total - len(failures)}/{total} verification-gate cases behaved")
+    print(f"{total - len(failures)}/{total} gate cases behaved "
+          f"(gap bound {MAX_SEGMENT_GAP} chars)")
     return 1 if failures else 0
 
 

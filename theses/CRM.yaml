@@ -1,13 +1,10 @@
 ticker: CRM
 name: Salesforce — subscription growth / AI competition thesis
 claims:
-  # The 8% threshold is a judgement call, not a fact. It sits a little under the
-  # ~10.8% the last two quarters printed, so it asks "is growth still healthy",
-  # not "is growth still accelerating". Move it if that is not the question.
   - id: TC-01
-    statement: "Subscription and support revenue growth remains at or above 8%
-      year over year, and subscription — not professional services — is what
-      carries the total"
+    statement: "Subscription and support revenue growth remains healthy year over
+      year, and subscription — not professional services — is what carries the
+      total"
     type: quantitative
     # CRM stopped tagging `Revenues` after FY2016; the live concept is
     # RevenueFromContractWithCustomerExcludingAssessedTax. That is TOTAL
@@ -18,12 +15,33 @@ claims:
     bindings:
       - tag: RevenueFromContractWithCustomerExcludingAssessedTax
         direction: increasing
-        threshold: ">= 8% YoY"
+        # Two levels, not one. A single 8% bound sat ~280bp under the last print
+        # while subscription growth was already stepping down 14% -> 12%, so it
+        # could not fire for several quarters no matter what the trend did. A
+        # falsifier with that much headroom carries almost no information.
+        # `watch` is where the step-down stops being a wobble; `falsified` is
+        # where the claim's premise is gone.
+        bands:
+          watch: "10% YoY"
+          falsified: "8% YoY"
+    # Checked against EDGAR: there is no companyconcept endpoint that returns
+    # the subscription/services split. `SubscriptionRevenue` and
+    # `SubscriptionAndCirculationRevenue` return nothing for CRM, and
+    # `TechnologyServicesRevenue` (the old professional-services line) stops in
+    # 2018. The live split exists only behind a product/service axis, which the
+    # API does not serve. So the second half of this claim cannot be sourced the
+    # way the first half can, and the agent is told to say so rather than read a
+    # table and present it as if it were tagged data.
+    unverifiable_from_xbrl:
+      - "The subscription vs professional services split. Only total revenue is
+        available as a tagged concept; any split figure has to be read from the
+        MD&A revenue table, so flag it as text-sourced rather than XBRL-verified."
     falsifiers:
-      - "Total revenue YoY growth below 8% for two consecutive quarters"
+      - "Total revenue YoY growth below the falsified band for two consecutive
+        quarters"
       - "Subscription and support revenue growth decelerating while
         professional services carries the total"
-      - "Management guides to subscription growth below the threshold"
+      - "Management guides to subscription growth below the falsified band"
     sections: [mda, financials]
 
   - id: TC-02

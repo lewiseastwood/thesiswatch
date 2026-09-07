@@ -21,6 +21,13 @@ import yaml
 SEC_UA = "ThesisWatch research/0.1 (you@example.com)"
 MODEL = "claude-sonnet-5"
 
+# Thinking is on by default for this model generation and draws on the same
+# budget: a run capped at 700 spent the entire allowance on a thinking block and
+# never emitted a tool call. 4000 left so little room for a long verdict that
+# submit_verdict payloads came back mis-serialized. Raising this lowers the odds
+# but is not the safeguard -- validate_payload is.
+MAX_TOKENS = 8000
+
 # There is no sampling knob to pin here: the API rejects both `temperature` and
 # `top_k` for this model generation as "deprecated for this model", and neither
 # appears in the SDK. Run-to-run verdict stability therefore has to come from
@@ -159,6 +166,29 @@ def split_sections(text: str, form: str = "10-K") -> dict[str, str]:
     return out
 
 
+def slice_words(body: str, start: int, end: int) -> str:
+    """Slice `body`, moving each cut end to a word boundary and marking it.
+
+    A raw character slice leaves a half-word at the edge, the model copies it
+    into an excerpt verbatim, and the quote verifies but renders as "…displace
+    established user inte". Trimming to a boundary and marking the cut with an
+    ellipsis keeps quotes readable, and the gate already understands an ellipsis
+    as elision, so nothing is loosened to allow it.
+    """
+    lo, hi = max(0, start), min(len(body), end)
+    cut_head, cut_tail = lo > 0, hi < len(body)
+    if cut_head:
+        nxt = body.find(" ", lo)
+        if 0 <= nxt < hi:
+            lo = nxt + 1
+    if cut_tail:
+        prev = body.rfind(" ", lo, hi)
+        if prev > lo:
+            hi = prev
+    out = body[lo:hi].strip()
+    return ("… " if cut_head else "") + out + (" …" if cut_tail else "")
+
+
 def diff_summary(old: str, new: str, max_blocks: int = 40) -> str:
     """Paragraph-level diff. Boilerplate churn is noise; this surfaces real edits."""
     a = [p.strip() for p in old.split("\n") if len(p.strip()) > 80]
@@ -192,7 +222,18 @@ def load_thesis(ticker: str) -> dict:
             f"No thesis for {ticker.upper()!r} at {path}. "
             f"Available: {', '.join(available) or '(none)'}"
         )
-    return yaml.safe_load(path.read_text())
+    thesis = yaml.safe_load(path.read_text())
+    for claim in thesis.get("claims", []):
+        for b in claim.get("bindings", []):
+            missing = {"watch", "falsified"} - set(b.get("bands") or {})
+            if missing:
+                raise ValueError(
+                    f"{path.name}, claim {claim.get('id')}: binding on "
+                    f"{b.get('tag')!r} declares no {'/'.join(sorted(missing))} band. "
+                    f"A bound metric needs both levels, or the claim can only "
+                    f"report pass/fail and will read green until it breaks."
+                )
+    return thesis
 
 
 @dataclass
@@ -200,6 +241,11 @@ class Verdict:
     claim_id: str
     statement: str
     verdict: str = "insufficient_evidence"
+    # Where the metric stands against the claim's bands, which is a separate
+    # question from whether this filing moved it. A claim can be unchanged and
+    # sitting in the watch band, and that pairing is the whole point: a single
+    # bound reads green every quarter until it breaks all at once.
+    band: str = "not_applicable"
     reasoning: str = ""
     excerpts: list[dict] = field(default_factory=list)
     metrics: list[dict] = field(default_factory=list)
@@ -283,6 +329,20 @@ TOOLS = [
                     "type": "string",
                     "enum": ["strengthened", "weakened", "unchanged", "insufficient_evidence"],
                 },
+                "band": {
+                    "type": "string",
+                    "description": (
+                        "For a claim whose bindings declare bands, where the metric now "
+                        "sits: above_watch (clear of both levels), watch_band (past the "
+                        "watch level but not the falsified level — deteriorating and "
+                        "worth attention), below_falsified (the falsified level is "
+                        "breached). Use not_applicable when the claim declares no bands. "
+                        "This is independent of the verdict: report the level you "
+                        "measured, not whether it moved."
+                    ),
+                    "enum": ["above_watch", "watch_band", "below_falsified",
+                             "not_applicable"],
+                },
                 "reasoning": {"type": "string"},
                 "excerpts": {
                     "type": "array",
@@ -343,7 +403,7 @@ class Context:
                 have = list(self.sections[inp["filing"]])
                 return f"Section not extracted. Available: {have}"
             off = int(inp.get("offset", 0))
-            chunk = body[off:off + 12000]
+            chunk = slice_words(body, off, off + 12000)
             more = "" if off + 12000 >= len(body) else \
                 f"\n\n[truncated — {len(body) - off - 12000} chars remain, use offset={off + 12000}]"
             return chunk + more
@@ -356,7 +416,7 @@ class Context:
         if name == "search_filing":
             body = self.text[inp.get("filing", "current")]
             q = re.escape(inp["query"])
-            hits = [body[max(0, m.start() - 400):m.start() + 600]
+            hits = [slice_words(body, m.start() - 400, m.start() + 600)
                     for m in re.finditer(q, body, re.I)][:6]
             return "\n\n---\n\n".join(hits) or "No matches."
 
@@ -397,6 +457,21 @@ def tidy_excerpt(text: str) -> str:
 # fragments verifies nothing and is rejected.
 MIN_SEGMENT = 12
 
+# How far a quote may jump between two elided segments.
+#
+# Order alone does not constrain distance, so without this a composite stitched
+# from fragments in different Items passes: "we face increasing competition"
+# from the risk factors joined to "pricing pressure" from MD&A, each verbatim,
+# each in order, together asserting a sentence the filing never contains. A
+# quote fabricated by omission is the exact thing this gate exists to catch.
+#
+# 400 is set from measurement, not taste: instrumenting a full ADBE and CRM run
+# showed every accepted excerpt matching as one contiguous run, max hop 0,
+# because folding page furniture out of both sides already closes the
+# page-break case. So this only needs to leave room for eliding a clause or two
+# inside a single passage, and anything reaching across sections is rejected.
+MAX_SEGMENT_GAP = 400
+
 
 def is_verbatim(text: str, hay: str) -> bool:
     """True if every substantive run of `text` appears in `hay`, in order.
@@ -408,16 +483,26 @@ def is_verbatim(text: str, hay: str) -> bool:
     matters: no words the filing does not contain, in the order it contains
     them. Fabricated text still fails.
     """
-    pos, matched = 0, 0
+    pos, matched, anchored = 0, 0, False
     for seg in ELLIPSIS_RE.split(norm(text)[:300]):
         seg = seg.strip()
-        if len(seg) < MIN_SEGMENT:
+        if not seg:
+            continue
+        short = len(seg) < MIN_SEGMENT
+        # A short run is normally connective tissue and goes unmatched. A short
+        # run holding a figure does not: "… 41.5% …" is small enough to hide in,
+        # and a number nobody checked is the one thing this gate cannot pass.
+        if short and not any(c.isdigit() for c in seg):
             continue
         at = hay.find(seg, pos)
         if at < 0:
             return False
+        if anchored and at - pos > MAX_SEGMENT_GAP:
+            return False
         pos = at + len(seg)
-        matched += 1
+        anchored = True
+        if not short:
+            matched += 1
     return matched > 0
 
 
@@ -443,6 +528,52 @@ def verify(v: Verdict, ctx: Context) -> Verdict:
     return v
 
 
+# Tool-call serialization that has no business inside a string field. When a
+# submit_verdict payload comes back mis-serialized, the trailing structure gets
+# absorbed into whichever field was mid-write, so this markup appearing in a
+# text field means other fields were silently lost.
+MARKUP_RE = re.compile(
+    r"</?\s*(?:antml:)?(?:reasoning|parameter|invoke|function_calls|"
+    r"function_results|thinking)\b[^>]*>", re.I)
+
+
+def strip_markup(text: str) -> tuple[str, bool]:
+    """Return `text` cut at the first leaked tool-call tag, and whether it leaked."""
+    if not text:
+        return "", False
+    hit = MARKUP_RE.search(text)
+    if not hit:
+        return text, False
+    return text[:hit.start()].rstrip(), True
+
+
+def validate_payload(v: Verdict, payload: dict, stop_reason: str | None) -> str:
+    """Return a rejection reason if this verdict rests on a partial payload.
+
+    A truncated or mis-serialized tool call does not announce itself. The
+    observed failure arrived with stop_reason "tool_use" and all five keys
+    present, while needs_review had been swallowed into reasoning and three
+    excerpts never became excerpts at all -- they rendered into the report as
+    raw JSON inside the prose, with the verification gate never running on
+    them. So the payload is checked for the markup that proves a field boundary
+    was lost, not just for the stop reason.
+    """
+    if stop_reason == "max_tokens":
+        return (f"Model output hit the {MAX_TOKENS}-token cap, so the verdict "
+                f"payload was cut off mid-serialization and any fields after the "
+                f"cut are missing. Verdict discarded rather than reported from a "
+                f"partial response.")
+    leaked = sorted({k for k, val in payload.items()
+                     if isinstance(val, str) and MARKUP_RE.search(val)})
+    if leaked:
+        return (f"Verdict payload was mis-serialized: raw tool-call markup appeared "
+                f"inside {', '.join(leaked)}, which means at least one later field "
+                f"was absorbed into an earlier one and never parsed. Any excerpts "
+                f"lost this way would bypass the verification gate entirely, so the "
+                f"verdict is discarded rather than reported from a partial payload.")
+    return ""
+
+
 def score_confidence(v: Verdict) -> str:
     n = len(v.excerpts) + len(v.metrics)
     if v.verdict == "insufficient_evidence" or n == 0:
@@ -459,6 +590,13 @@ against a company's newest SEC filing versus the prior comparable filing.
 Rules:
 - Investigate with the tools before judging. Do not answer from prior knowledge.
 - Numbers come from get_metric only. Never state a figure you did not retrieve.
+- A figure read out of filing prose or a table is not tagged data, even when the
+  excerpt around it verifies. If a claim lists unverifiable_from_xbrl, or you find
+  yourself reading a number off a table because no binding supplies it, say so in
+  the reasoning and add a needs_review entry naming that figure as text-sourced.
+- Take fiscal-period labels from the filing itself. A non-calendar year end makes
+  the fiscal year differ from the calendar year, and mislabelling which quarter
+  you compared makes the whole comparison unreadable.
 - Excerpts must be copied verbatim from tool output, under 60 words each. Use an
   ellipsis (…) to mark text you skip inside a quote, including page-break debris
   like "38 Table of Contents" sitting mid-sentence. Never paraphrase inside a quote.
@@ -474,15 +612,23 @@ be unchanged, because nothing new was disclosed.
 - weakened: this filing moves the claim measurably toward a falsifier, or a
   falsifier is now met.
 - unchanged: the two filings support the claim about equally — the disclosure is
-  the same in substance, or a bound metric moved without changing where it stands
-  against its threshold.
+  the same in substance, or a bound metric moved without changing which band it
+  sits in.
 - insufficient_evidence: the tools did not establish where the claim stands.
-For a bound metric, "measurably" means the margin between the metric and its
-threshold moved by more than ordinary quarter-to-quarter variation; a metric that
-stays on the same side of its threshold with a similar margin is unchanged.
+For a bound metric, "measurably" means the margin against the bands moved by more
+than ordinary quarter-to-quarter variation; a metric that stays in the same band
+with a similar margin is unchanged.
 If two verdicts look equally defensible, return unchanged and put the tension in
 needs_review. Do not resolve a genuine ambiguity by picking the more interesting
 verdict — a verdict has to mean the filing moved, or it tells the analyst nothing.
+
+Bands are a separate axis from the verdict, and you report both. The verdict says
+whether the filing moved; the band says what level the metric is at now. Report
+the band you measured even when the verdict is unchanged — a metric drifting
+through the watch band while each single quarter looks unremarkable is exactly
+what the band exists to surface. Compute it from get_metric values against the
+`bands` in the claim's bindings, and say in your reasoning which YoY figures you
+compared. If a claim declares no bands, the band is not_applicable.
 Finish by calling submit_verdict exactly once."""
 
 
@@ -492,6 +638,8 @@ def evaluate_claim(client, ctx: Context, claim: dict, max_turns: int = 12) -> Ve
         f"Claim {claim['id']}: {claim['statement']}\n"
         f"Type: {claim.get('type')}\n"
         f"Would be falsified by: {claim.get('falsifiers', [])}\n"
+        f"Cannot be sourced from XBRL (flag as text-sourced if you rely on it): "
+        f"{claim.get('unverifiable_from_xbrl', [])}\n"
         f"Suggested sections: {claim.get('sections', [])}\n"
         f"Metric bindings: {claim.get('bindings', [])}\n\n"
         f"Current filing: {ctx.current['form']} filed {ctx.current['filingDate']} "
@@ -501,11 +649,22 @@ def evaluate_claim(client, ctx: Context, claim: dict, max_turns: int = 12) -> Ve
     )
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
-    for _ in range(max_turns):
+    for _turn in range(max_turns):
         resp = client.messages.create(
-            model=MODEL, max_tokens=4000, system=SYSTEM,
+            model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM,
             tools=TOOLS, messages=messages,
         )
+        # Bail before any block from a capped turn is read. Whatever was being
+        # written when the cap hit is incomplete, so dispatching its tool calls
+        # would act on half-serialized arguments.
+        if resp.stop_reason == "max_tokens":
+            v.verdict = "insufficient_evidence"
+            v.confidence = "low"
+            v.needs_review.append(
+                f"Model output hit the {MAX_TOKENS}-token cap on turn {_turn} "
+                f"before a verdict was submitted, so the response was cut "
+                f"mid-serialization and was discarded.")
+            return v
         messages.append({"role": "assistant", "content": resp.content})
         if resp.stop_reason != "tool_use":
             break
@@ -517,7 +676,14 @@ def evaluate_claim(client, ctx: Context, claim: dict, max_turns: int = 12) -> Ve
             v.tool_calls += 1
             if block.name == "submit_verdict":
                 i = block.input
+                bad = validate_payload(v, i, resp.stop_reason)
+                if bad:
+                    v.verdict = "insufficient_evidence"
+                    v.confidence = "low"
+                    v.needs_review.append(bad)
+                    return v
                 v.verdict = i.get("verdict", v.verdict)
+                v.band = i.get("band", "not_applicable")
                 v.reasoning = i.get("reasoning", "")
                 v.excerpts = i.get("excerpts", [])
                 v.metrics = i.get("metrics", [])
@@ -540,6 +706,14 @@ def evaluate_claim(client, ctx: Context, claim: dict, max_turns: int = 12) -> Ve
 
 
 # ------------------------------------------------------------- report
+BAND_LABELS = {
+    "above_watch": "above watch",
+    "watch_band": "**watch band**",
+    "below_falsified": "**falsified level breached**",
+    "not_applicable": "—",
+}
+
+
 def build_report(ctx: Context, thesis: dict, verdicts: list[Verdict]) -> str:
     L = [f"# ThesisWatch — {thesis['ticker']}",
          "",
@@ -553,16 +727,42 @@ def build_report(ctx: Context, thesis: dict, verdicts: list[Verdict]) -> str:
          f"· [{ctx.prior['accessionNumber']}]({ctx.prior['index_url']})",
          "",
          "## Summary", "",
-         "| Claim | Verdict | Confidence | Evidence | Tool calls |",
-         "|---|---|---|---|---|"]
+         "| Claim | Verdict | Band | Confidence | Evidence | Tool calls |",
+         "|---|---|---|---|---|---|"]
     for v in verdicts:
-        L.append(f"| {v.claim_id} | **{v.verdict}** | {v.confidence} | "
+        L.append(f"| {v.claim_id} | **{v.verdict}** | "
+                 f"{BAND_LABELS.get(v.band, v.band)} | {v.confidence} | "
                  f"{len(v.excerpts)} excerpt(s), {len(v.metrics)} metric(s) | {v.tool_calls} |")
+
+    # A verdict of "unchanged" says the filing did not move. It does not say the
+    # metric is comfortable, so the level gets its own line rather than being
+    # left for the reader to infer from a green-looking table.
+    banded = [v for v in verdicts if v.band in ("watch_band", "below_falsified")]
+    if banded:
+        L += ["", "Level alert — unchanged does not mean comfortable:"]
+        L += [f"- **{v.claim_id}** is {BAND_LABELS[v.band]} (verdict: {v.verdict})"
+              for v in banded]
+
+    # Rendering is the last place this can be caught, so it does not trust the
+    # reasoning string even if the payload check upstream passed it. Leaked
+    # markup means the prose after it is serialized tool arguments, which would
+    # show a reader quotes that never went through the verification gate.
+    render_flags = []
+    for v in verdicts:
+        _, leaked = strip_markup(v.reasoning)
+        if leaked:
+            render_flags.append(
+                (v.claim_id, "Reasoning contained raw tool-call markup and was "
+                             "truncated at the leak. Any quotes past that point were "
+                             "never verified and are not shown; re-run this claim."))
 
     L += ["", "## Claim detail", ""]
     for v in verdicts:
+        band = (f" · band {BAND_LABELS.get(v.band, v.band)}"
+                if v.band != "not_applicable" else "")
+        reasoning, _ = strip_markup(v.reasoning)
         L += [f"### {v.claim_id} — {v.statement}", "",
-              f"**{v.verdict}** · confidence {v.confidence}", "", v.reasoning, ""]
+              f"**{v.verdict}** · confidence {v.confidence}{band}", "", reasoning, ""]
         for m in v.metrics:
             L.append(f"- `{m['tag']}` {m['period']}: {m['value']:,} "
                      f"{('— ' + m['note']) if m.get('note') else ''}")
@@ -571,7 +771,7 @@ def build_report(ctx: Context, thesis: dict, verdicts: list[Verdict]) -> str:
                   f"  — {ex['filing']} filing, {ex['section']}"]
         L.append("")
 
-    flags = [(v.claim_id, n) for v in verdicts for n in v.needs_review]
+    flags = [(v.claim_id, n) for v in verdicts for n in v.needs_review] + render_flags
     L += ["## Requires analyst review", ""]
     L += [f"- **{cid}** — {n}" for cid, n in flags] or ["- No automated flags raised."]
     L += ["", "Verify all figures against the source filing before acting on them."]

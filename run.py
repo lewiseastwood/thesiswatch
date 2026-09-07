@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import thesiswatch
 from thesiswatch import Context, Edgar, build_report, evaluate_claim, load_thesis
 
-DEFAULT_TICKER = "ADBE"
+DEFAULT_TICKER = "CRM"
 FORM = "10-Q"
 OUT = Path(__file__).parent / "report.md"
 
@@ -47,7 +47,7 @@ def main() -> int:
 
     try:
         thesis = load_thesis(ticker)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         print(e, file=sys.stderr)
         return 1
 

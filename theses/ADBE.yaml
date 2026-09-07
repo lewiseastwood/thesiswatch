@@ -2,14 +2,20 @@ ticker: ADBE
 name: Adobe — software mix / margin thesis
 claims:
   - id: TC-01
-    statement: "Revenue growth remains above 9% year over year"
+    statement: "Revenue growth remains healthy year over year"
     type: quantitative
     bindings:
       - tag: Revenues
         direction: increasing
-        threshold: ">= 9% YoY"
+        # 9% alone sat ~370bp below the last print, so the claim read green
+        # every quarter until it would have broken all at once. `watch` is where
+        # the growth story starts changing; `falsified` is the old 9% bound.
+        bands:
+          watch: "11% YoY"
+          falsified: "9% YoY"
     falsifiers:
-      - "YoY revenue growth below 9% for two consecutive quarters"
+      - "YoY revenue growth below the falsified band for two consecutive
+        quarters"
     sections: [mda, financials]
   - id: TC-02
     statement: "Competitive pressure from generative AI entrants is not yet
