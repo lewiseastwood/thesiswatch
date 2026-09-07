@@ -1,6 +1,6 @@
 """Run ThesisWatch against a company's two most recent 10-Q filings.
 
-    python run.py            # defaults to ADBE
+    python run.py            # uses DEFAULT_TICKER below
     python run.py MSFT       # needs theses/MSFT.yaml
 
 Analyst-support tool. Does not produce buy/sell recommendations.
@@ -15,7 +15,8 @@ import anthropic
 from dotenv import load_dotenv
 
 import thesiswatch
-from thesiswatch import Context, Edgar, build_report, evaluate_claim, load_thesis
+from thesiswatch import (Context, Edgar, build_report, evaluate_claim,
+                         load_thesis, save_run)
 
 DEFAULT_TICKER = "CRM"
 FORM = "10-Q"
@@ -80,6 +81,7 @@ def main() -> int:
 
     OUT.write_text(build_report(ctx, thesis, verdicts))
     print(f"Wrote {OUT}")
+    print(f"Wrote {save_run(ticker, thesis, ctx, verdicts)}")
     return 0
 
 

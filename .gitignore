@@ -1,6 +1,10 @@
 .env
 .venv/
 
+# One JSON per run, so these accumulate. The dashboard reads whatever is here;
+# report.md stays tracked because it is a single overwritten file.
+runs/
+
 __pycache__/
 *.py[cod]
 .DS_Store

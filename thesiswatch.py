@@ -12,8 +12,9 @@ Analyst-support tool. Does not produce buy/sell recommendations.
 
 import json, re, time, html, difflib, hashlib
 from dataclasses import dataclass, field, asdict
+from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 import yaml
@@ -211,6 +212,12 @@ def diff_summary(old: str, new: str, max_blocks: int = 40) -> str:
 
 # ------------------------------------------------------------- thesis
 THESES_DIR = Path(__file__).parent / "theses"
+RUNS_DIR = Path(__file__).parent / "runs"
+
+
+def available_tickers() -> list[str]:
+    """Tickers with a thesis on disk."""
+    return sorted(p.stem for p in THESES_DIR.glob("*.yaml"))
 
 
 def load_thesis(ticker: str) -> dict:
@@ -252,6 +259,91 @@ class Verdict:
     confidence: str = "low"
     needs_review: list[str] = field(default_factory=list)
     tool_calls: int = 0
+
+
+# ------------------------------------------------------- persisted runs
+def save_run(ticker: str, thesis: dict, ctx: "Context",
+             verdicts: list[Verdict]) -> Path:
+    """Write one run to runs/ as structured data and return the path.
+
+    The markdown report is for reading; this is for querying. Only excerpts
+    that passed the gate are stored, and each keeps its `verified` marker, so a
+    consumer cannot accidentally display an unverified quote — that mistake has
+    already been made once by rendering straight from a model payload.
+    """
+    RUNS_DIR.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    payload = {
+        "ticker": ticker,
+        "thesis_name": thesis.get("name", ""),
+        "run_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        "form": ctx.current["form"],
+        "filings": {
+            which: {k: f[k] for k in ("filingDate", "reportDate",
+                                      "accessionNumber", "index_url", "url")}
+            for which, f in (("current", ctx.current), ("prior", ctx.prior))
+        },
+        "claims": [dict(asdict(v),
+                        excerpts=[e for e in v.excerpts if e.get("verified")])
+                   for v in verdicts],
+    }
+    path = RUNS_DIR / f"{ticker.upper()}-{stamp}.json"
+    path.write_text(json.dumps(payload, indent=1))
+    return path
+
+
+def load_runs(ticker: str | None = None) -> list[dict]:
+    """Every persisted run, newest first, optionally for one ticker."""
+    pattern = f"{ticker.upper()}-*.json" if ticker else "*.json"
+    runs = []
+    for p in sorted(RUNS_DIR.glob(pattern), reverse=True):
+        try:
+            run = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        run["_path"] = str(p)
+        runs.append(run)
+    return runs
+
+
+# --------------------------------------------------- metric time series
+def band_pct(band: str | None) -> float | None:
+    """Pull the number out of a band written like ">= 8% YoY" or "10% YoY"."""
+    if not band:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", str(band))
+    return float(m.group()) if m else None
+
+
+def quarterly_yoy(rows: list[dict]) -> list[dict]:
+    """Deduplicated quarterly points, oldest first, with YoY growth where computable.
+
+    XBRL returns the same period once per filing that reported it, so points are
+    keyed by their date range and the latest report of each wins. A quarter is
+    matched to the one a year earlier by date rather than by index, because a
+    filer's history has gaps and a 52/53-week calendar drifts a few days.
+    """
+    by_period: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        if r.get("unit") != "USD" or not (r.get("start") and r.get("end")):
+            continue
+        try:
+            start = date.fromisoformat(r["start"])
+            end = date.fromisoformat(r["end"])
+        except ValueError:
+            continue
+        if not 80 <= (end - start).days <= 100:  # one quarter, not a YTD roll-up
+            continue
+        by_period[(r["start"], r["end"])] = {"start": start, "end": end,
+                                             "val": r["val"], "tag": r["tag"]}
+
+    points = sorted(by_period.values(), key=lambda p: p["end"])
+    for p in points:
+        prior = next((q for q in points
+                      if 330 <= (p["end"] - q["end"]).days <= 400), None)
+        p["yoy"] = (round((p["val"] / prior["val"] - 1) * 100, 2)
+                    if prior and prior["val"] else None)
+    return points
 
 
 # -------------------------------------------------------------- tools
@@ -632,7 +724,14 @@ compared. If a claim declares no bands, the band is not_applicable.
 Finish by calling submit_verdict exactly once."""
 
 
-def evaluate_claim(client, ctx: Context, claim: dict, max_turns: int = 12) -> Verdict:
+def evaluate_claim(client, ctx: Context, claim: dict, max_turns: int = 12,
+                   on_tool: Callable[[str, dict], None] | None = None) -> Verdict:
+    """Run one claim to a verdict.
+
+    `on_tool` is called with (tool_name, arguments) as each call is made, so a
+    caller can show the investigation as it happens. It is optional and the CLI
+    does not pass it.
+    """
     v = Verdict(claim_id=claim["id"], statement=claim["statement"])
     prompt = (
         f"Claim {claim['id']}: {claim['statement']}\n"
@@ -674,6 +773,8 @@ def evaluate_claim(client, ctx: Context, claim: dict, max_turns: int = 12) -> Ve
             if block.type != "tool_use":
                 continue
             v.tool_calls += 1
+            if on_tool:
+                on_tool(block.name, block.input or {})
             if block.name == "submit_verdict":
                 i = block.input
                 bad = validate_payload(v, i, resp.stop_reason)
