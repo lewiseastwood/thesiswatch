@@ -1,6 +1,7 @@
 # Notes
 
-Two things went wrong on ADBE that were worth more than the time it took to fix them.
+Three things worth more than the time it took to fix them. The first two went wrong
+on ADBE; the third is about how the tests for all of it are built.
 
 ## 1. The same filings produced two different verdicts
 
@@ -68,3 +69,86 @@ Two things I'd flag about how this bug hid. It cost confidence, not just evidenc
 the dropped excerpts pushed TC-02 from `high` to `medium`, so the tool understated
 what it actually knew. And the error message pointed at the model rather than the
 extractor, so the report blamed the one component that was behaving.
+
+## 3. Fixtures the pipeline cannot produce
+
+Building fixtures only out of what the pipeline currently emits makes the test
+conditional on the code already being correct. If `save_run` filters unverified
+excerpts, then every run file on disk is clean, so a suite fed real run files can
+never tell whether the *reader* checks anything — it passes either way, and it
+passes for the wrong reason. The assertion you wanted to make was "the view refuses
+bad input"; what you actually asserted was "the writer doesn't produce bad input".
+Those come apart the moment anything else writes a record: an older version, a hand
+edit, a second producer, a migration.
+
+So `test_dashboard.py` hand-builds records the pipeline cannot write — an excerpt
+with `verified` absent, one with it `false`, a reasoning string with tool-call markup
+mid-sentence — and renders `app.py` against them with Streamlit's `AppTest`. Those
+inputs are unreachable through the real code path today, which is exactly why they
+are worth asserting: they are what a run persisted before a fix, or edited after it
+was written, actually looks like. This generalizes past this project. Fixtures should
+be drawn from what the *format* permits, not from what the current writer happens to
+emit, or the test inherits the bug it was written to catch.
+
+Doing that immediately found two holes on the reading side. The summary card counted
+`len(claim["excerpts"])` — every excerpt in the record — while the panel below it
+rendered only the verified ones, so a card could read "3 excerpts" above one quote.
+That is the same card-versus-body mismatch that let the mis-serialized CRM payload
+pass for finished analysis. Worse, `claim_panel` rendered the reasoning string raw:
+`build_report` had been running `strip_markup` on it since the CRM fix, but the
+dashboard never did, so leaked structure and the unverified quotes inside it would
+have gone straight to the page with no gate, no marking and no flag.
+
+The other half is that an assertion which passes the first time it runs is
+decoration. Each one was checked by reverting its fix on a scratch copy of the source
+and confirming the suite fails:
+
+| reverted behaviour | first suite to fail | on |
+|---|---|---|
+| view skips the integrity pass | `test_dashboard` | unverified excerpt rendered |
+| review section hidden when empty | `test_dashboard` | no explicit "nothing found" |
+| reasoning not cut at the leak | `test_dashboard` | leaked quote rendered |
+| leaked payload keeps its recorded verdict | `test_dashboard` | shown as `unchanged` |
+| unverified excerpts not filtered | `test_dashboard` | unverified excerpt rendered |
+| unverified excerpts dropped with no flag | `test_dashboard` | drop not reported |
+
+Worth noting the harness bug that nearly hid this: the first pass ran the reverts
+in-process, and `thesiswatch` was already in `sys.modules`, so four of the six edits
+were never loaded and reported as MISSED. A mutation check that silently fails to
+mutate looks exactly like a test suite with holes in it. Each variant now runs in a
+fresh interpreter against copies, and the tracked files are never touched.
+
+### Where the check belongs
+
+By this point the same judgement lived in two places — `build_report` stripping and
+flagging, `app.py` doing its own version — and they had already drifted: the report
+went on printing `**unchanged**` for a claim the dashboard had downgraded to
+insufficient evidence. Two implementations of "is this claim trustworthy" will
+diverge, and the one that diverges is the one nobody is currently looking at.
+
+That is now three appearances of one bug, each a layer further out: the payload
+(`validate_payload`), the markdown report (`strip_markup` in `build_report`), the
+dashboard. A check that has to be re-remembered at every consumer is in the wrong
+place, not repeatedly forgotten. Both now call `assess_integrity(claim)`, which
+returns the claim as it may be presented plus the flags that must accompany it, so a
+fourth consumer — a CSV export, an API — inherits it instead of becoming the next
+place the gate silently doesn't run. The report rebuilds byte-identical from the
+persisted ADBE run, so collapsing the two changed no output.
+
+Two judgements live there. Leaked markup means a field boundary was lost, so the
+text is cut at the leak *and* the verdict is downgraded — a partial parse cannot
+support `unchanged` any more than it can support `weakened`, so rendering the
+recorded verdict is rendering an artefact of the truncation. And an excerpt with no
+`verified` marker is dropped, with the drop reported rather than done quietly, which
+is the direct lesson of §2.
+
+### A limit worth naming
+
+None of this defends against a forged `verified: true`. Re-deriving that marker
+needs the filing text, which a consumer reading `runs/*.json` does not have. The
+trust boundary is `verify()`, and `save_run` is the last point at which a forged
+marker could be caught; every reader downstream can require only that the marker is
+present, never that it was earned. So the test asserts the honest thing — a hand-set
+marker *does* render — and pins the half that is enforceable where it lives, that
+`save_run` will not write an unmarked excerpt. Better written down as a known limit
+than discovered later as a surprise.

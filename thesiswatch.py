@@ -639,6 +639,58 @@ def strip_markup(text: str) -> tuple[str, bool]:
     return text[:hit.start()].rstrip(), True
 
 
+# One implementation of "may this claim be presented, and what has to be said
+# about it if so". Both the markdown report and the dashboard call it, and any
+# consumer added later inherits it. This class of bug has now surfaced three
+# times -- in the payload, in the report, in the dashboard -- each one layer
+# further out, which says the check was sitting in the wrong place rather than
+# being repeatedly forgotten.
+LEAK_FLAG = ("Reasoning contained raw tool-call markup, so this verdict rests on a "
+             "payload that lost a field boundary. The text is cut at the leak, the "
+             "verdict is not reportable, and any quotes past that point were never "
+             "verified and are not shown. Re-run this claim.")
+UNVERIFIED_FLAG = ("{n} excerpt(s) carried no verification marker and were not shown. "
+                   "A record written by save_run cannot contain these, so this run "
+                   "predates the gate or was edited after it was written.")
+
+
+def assess_integrity(claim: dict) -> tuple[dict, list[str]]:
+    """Return the claim as it may be presented, plus flags that must accompany it.
+
+    Two judgements, both re-derived from the record rather than taken from it:
+
+    Leaked markup in the reasoning proves a field boundary was lost, so the text
+    is cut at the leak and the verdict is downgraded. A partial parse cannot
+    support "unchanged" any more than it can support "weakened", so rendering
+    the recorded verdict would be rendering an artefact of the truncation.
+
+    An excerpt carrying no `verified` marker is not evidence: absent is not a
+    pass. Dropping one is reported rather than done quietly, because a gate that
+    silently does not run is the exact failure this path exists to prevent.
+
+    Known limit: `verified: true` is taken at face value. Re-deriving it needs
+    the filing text, which a consumer reading runs/*.json does not have. The
+    trust boundary is verify(), and save_run is the last point at which a forged
+    marker could be caught; downstream can only require that the marker is
+    present, never that it was earned.
+    """
+    c = dict(claim)
+    flags: list[str] = []
+
+    c["reasoning"], leaked = strip_markup(c.get("reasoning") or "")
+    if leaked:
+        c["verdict"] = "insufficient_evidence"
+        c["confidence"] = "low"
+        flags.append(LEAK_FLAG)
+
+    excerpts = c.get("excerpts") or []
+    c["excerpts"] = [e for e in excerpts if e.get("verified")]
+    if dropped := len(excerpts) - len(c["excerpts"]):
+        flags.append(UNVERIFIED_FLAG.format(n=dropped))
+
+    return c, flags
+
+
 def validate_payload(v: Verdict, payload: dict, stop_reason: str | None) -> str:
     """Return a rejection reason if this verdict rests on a partial payload.
 
@@ -816,6 +868,11 @@ BAND_LABELS = {
 
 
 def build_report(ctx: Context, thesis: dict, verdicts: list[Verdict]) -> str:
+    # The integrity pass runs here, from the same function the dashboard calls,
+    # so the two views cannot reach different conclusions about the same record.
+    assessed = [assess_integrity(asdict(v)) for v in verdicts]
+    claims = [c for c, _ in assessed]
+
     L = [f"# ThesisWatch — {thesis['ticker']}",
          "",
          "**Analyst-support tool. Not investment advice. No buy/sell recommendation "
@@ -830,49 +887,38 @@ def build_report(ctx: Context, thesis: dict, verdicts: list[Verdict]) -> str:
          "## Summary", "",
          "| Claim | Verdict | Band | Confidence | Evidence | Tool calls |",
          "|---|---|---|---|---|---|"]
-    for v in verdicts:
-        L.append(f"| {v.claim_id} | **{v.verdict}** | "
-                 f"{BAND_LABELS.get(v.band, v.band)} | {v.confidence} | "
-                 f"{len(v.excerpts)} excerpt(s), {len(v.metrics)} metric(s) | {v.tool_calls} |")
+    for c in claims:
+        L.append(f"| {c['claim_id']} | **{c['verdict']}** | "
+                 f"{BAND_LABELS.get(c['band'], c['band'])} | {c['confidence']} | "
+                 f"{len(c['excerpts'])} excerpt(s), {len(c['metrics'])} metric(s) "
+                 f"| {c['tool_calls']} |")
 
     # A verdict of "unchanged" says the filing did not move. It does not say the
     # metric is comfortable, so the level gets its own line rather than being
     # left for the reader to infer from a green-looking table.
-    banded = [v for v in verdicts if v.band in ("watch_band", "below_falsified")]
+    banded = [c for c in claims if c["band"] in ("watch_band", "below_falsified")]
     if banded:
         L += ["", "Level alert — unchanged does not mean comfortable:"]
-        L += [f"- **{v.claim_id}** is {BAND_LABELS[v.band]} (verdict: {v.verdict})"
-              for v in banded]
-
-    # Rendering is the last place this can be caught, so it does not trust the
-    # reasoning string even if the payload check upstream passed it. Leaked
-    # markup means the prose after it is serialized tool arguments, which would
-    # show a reader quotes that never went through the verification gate.
-    render_flags = []
-    for v in verdicts:
-        _, leaked = strip_markup(v.reasoning)
-        if leaked:
-            render_flags.append(
-                (v.claim_id, "Reasoning contained raw tool-call markup and was "
-                             "truncated at the leak. Any quotes past that point were "
-                             "never verified and are not shown; re-run this claim."))
+        L += [f"- **{c['claim_id']}** is {BAND_LABELS[c['band']]} "
+              f"(verdict: {c['verdict']})" for c in banded]
 
     L += ["", "## Claim detail", ""]
-    for v in verdicts:
-        band = (f" · band {BAND_LABELS.get(v.band, v.band)}"
-                if v.band != "not_applicable" else "")
-        reasoning, _ = strip_markup(v.reasoning)
-        L += [f"### {v.claim_id} — {v.statement}", "",
-              f"**{v.verdict}** · confidence {v.confidence}{band}", "", reasoning, ""]
-        for m in v.metrics:
+    for c in claims:
+        band = (f" · band {BAND_LABELS.get(c['band'], c['band'])}"
+                if c["band"] != "not_applicable" else "")
+        L += [f"### {c['claim_id']} — {c['statement']}", "",
+              f"**{c['verdict']}** · confidence {c['confidence']}{band}", "",
+              c["reasoning"], ""]
+        for m in c["metrics"]:
             L.append(f"- `{m['tag']}` {m['period']}: {m['value']:,} "
                      f"{('— ' + m['note']) if m.get('note') else ''}")
-        for ex in v.excerpts:
+        for ex in c["excerpts"]:
             L += ["", f"> {tidy_excerpt(ex['text'])}", "",
                   f"  — {ex['filing']} filing, {ex['section']}"]
         L.append("")
 
-    flags = [(v.claim_id, n) for v in verdicts for n in v.needs_review] + render_flags
+    flags = ([(c["claim_id"], n) for c in claims for n in c["needs_review"]]
+             + [(c["claim_id"], f) for c, fl in assessed for f in fl])
     L += ["## Requires analyst review", ""]
     L += [f"- **{cid}** — {n}" for cid, n in flags] or ["- No automated flags raised."]
     L += ["", "Verify all figures against the source filing before acting on them."]

@@ -178,7 +178,15 @@ def check_payloads(failures: list[str]) -> int:
         failures.append("build_report rendered an unverified excerpt from leaked markup")
     if "never verified" not in report:
         failures.append("build_report did not flag the claim whose reasoning leaked")
-    return len(cases) + 3
+    # The report and the dashboard now share assess_integrity, so they cannot
+    # disagree about this. Before they did: the report went on printing
+    # "**unchanged**" for a claim the dashboard had already downgraded.
+    if "**unchanged**" in report:
+        failures.append("build_report presented a leaked-payload claim under its "
+                        "recorded verdict")
+    if "**insufficient_evidence**" not in report:
+        failures.append("build_report did not downgrade a leaked-payload claim")
+    return len(cases) + 5
 
 
 def main() -> int:

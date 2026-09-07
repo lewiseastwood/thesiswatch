@@ -17,9 +17,9 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import thesiswatch
-from thesiswatch import (BAND_LABELS, Context, Edgar, available_tickers,
-                         band_pct, evaluate_claim, load_runs, load_thesis,
-                         quarterly_yoy, save_run, strip_markup, tidy_excerpt)
+from thesiswatch import (BAND_LABELS, Context, Edgar, assess_integrity,
+                         available_tickers, band_pct, evaluate_claim, load_runs,
+                         load_thesis, quarterly_yoy, save_run, tidy_excerpt)
 
 FORM = "10-Q"
 
@@ -86,40 +86,17 @@ def bound_metrics(thesis: dict) -> list[tuple[str, dict]]:
             for c in thesis.get("claims", []) for b in c.get("bindings", [])]
 
 
-# ------------------------------------------------------------ integrity
-# The gate upstream decides what counts as evidence. Everything below re-derives
-# that decision from the stored record instead of trusting it, because a run
-# file can predate a fix or be edited by hand, and the view is the last thing
-# between a model payload and someone reading it as fact.
-LEAK_NOTE = ("Reasoning contains raw tool-call markup, so this verdict was "
-             "assembled from a mis-serialized payload: at least one field "
-             "boundary was lost. Anything past the leak was never verified and "
-             "is not shown, and the verdict itself is not reportable. Re-run "
-             "this claim.")
+def assess(claims: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Run the package's integrity pass once, before anything is drawn.
 
-
-def presentable(c: dict) -> tuple[str, str, bool]:
-    """Return the verdict and reasoning safe to show, and whether it leaked.
-
-    A payload carrying serialization markup lost a field boundary, so its
-    verdict rests on a partial parse. It is shown as insufficient_evidence --
-    what validate_payload would have recorded had it caught the payload -- and
-    not as the verdict it claims to be.
+    Every pane below receives the assessed claims, so no pane can reach past the
+    check to the raw record. The judgement itself lives in assess_integrity so
+    the report and this share one implementation — the alternative drifted
+    within a day of being written twice.
     """
-    reasoning, leaked = strip_markup(c.get("reasoning", "") or "")
-    verdict = "insufficient_evidence" if leaked else c.get(
-        "verdict", "insufficient_evidence")
-    return verdict, reasoning, leaked
-
-
-def verified_excerpts(c: dict) -> list[dict]:
-    """Only excerpts the gate passed. An absent flag is not a pass."""
-    return [e for e in c.get("excerpts", []) if e.get("verified")]
-
-
-def integrity_flags(claims: list[dict]) -> list[tuple[str, str]]:
-    """Review items the view raises itself, beyond what the run recorded."""
-    return [(c["claim_id"], LEAK_NOTE) for c in claims if presentable(c)[2]]
+    assessed = [assess_integrity(c) for c in claims]
+    return ([c for c, _ in assessed],
+            [(c["claim_id"], f) for c, fl in assessed for f in fl])
 
 
 # ---------------------------------------------------------------- panes
@@ -139,10 +116,10 @@ def header(run: dict) -> None:
         unsafe_allow_html=True)
 
 
-def review_queue(claims: list[dict]) -> None:
+def review_queue(claims: list[dict], extra: list[tuple[str, str]]) -> None:
     """Pinned near the top: the things a threshold check would never surface."""
     flags = ([(c["claim_id"], n) for c in claims for n in c.get("needs_review", [])]
-             + integrity_flags(claims))
+             + extra)
     st.markdown(
         f"#### Requires analyst review "
         f"<span class='tw-badge'>{len(flags)}</span>", unsafe_allow_html=True)
@@ -158,17 +135,17 @@ def review_queue(claims: list[dict]) -> None:
 
 def summary_strip(claims: list[dict]) -> None:
     for col, c in zip(st.columns(len(claims)), claims):
-        verdict, _, _ = presentable(c)
-        colour = VERDICT_COLOR.get(verdict, MUTED)
+        colour = VERDICT_COLOR.get(c["verdict"], MUTED)
         band = BAND_LABELS.get(c.get("band", "not_applicable"), "—").replace("*", "")
-        # Count what is actually shown below. A card reading "3 excerpts" over
-        # one rendered quote is how a mis-serialized payload stayed invisible
-        # in the markdown report.
-        n_ex, n_me = len(verified_excerpts(c)), len(c.get("metrics", []))
+        # Counts what is actually shown below, because the claims arriving here
+        # have already been through assess(). A card reading "3 excerpts" above
+        # one rendered quote is how a mis-serialized payload stayed invisible in
+        # the markdown report.
+        n_ex, n_me = len(c["excerpts"]), len(c.get("metrics", []))
         col.markdown(
             f"<div class='tw-card' style='--vc:{colour}'>"
             f"<div class='id'>{c['claim_id']}</div>"
-            f"<div class='verdict'>{verdict.replace('_', ' ')}</div>"
+            f"<div class='verdict'>{c['verdict'].replace('_', ' ')}</div>"
             f"<div class='meta'>band &nbsp;{band}<br>"
             f"confidence &nbsp;{c.get('confidence', '—')}<br>"
             f"evidence &nbsp;{n_ex} excerpt{'s' * (n_ex != 1)}, "
@@ -231,15 +208,17 @@ def trend_chart(ticker: str, thesis: dict) -> None:
         st.plotly_chart(fig, width="stretch")
 
 
-def claim_panel(c: dict) -> None:
-    verdict, reasoning, leaked = presentable(c)
+def claim_panel(c: dict, flags: list[tuple[str, str]]) -> None:
     band = BAND_LABELS.get(c.get("band", "not_applicable"), "—").replace("*", "")
-    label = (f"{c['claim_id']} — {verdict.replace('_', ' ')}"
+    label = (f"{c['claim_id']} — {c['verdict'].replace('_', ' ')}"
              f"{'' if band == '—' else f' · band {band}'} — {c['statement']}")
     with st.expander(label):
-        if leaked:
-            st.warning(LEAK_NOTE)
-        st.markdown(reasoning or "_No reasoning recorded._")
+        # The panel repeats its own integrity flags rather than leaving them to
+        # the queue above: a reader who opens one claim should not have to
+        # scroll back to learn the verdict was downgraded.
+        for note in [f for cid, f in flags if cid == c["claim_id"]]:
+            st.warning(note)
+        st.markdown(c["reasoning"] or "_No reasoning recorded._")
 
         metrics = c.get("metrics", [])
         if metrics:
@@ -250,10 +229,9 @@ def claim_panel(c: dict) -> None:
                  for m in metrics],
                 hide_index=True, width="stretch")
 
-        # Only verified excerpts are persisted, but the check is repeated here
-        # rather than assumed. Rendering an unverified quote as evidence is the
-        # exact failure this gate exists to prevent.
-        shown = verified_excerpts(c)
+        # assess_integrity has already dropped anything unverified, and said so
+        # in the flags above rather than dropping it quietly.
+        shown = c["excerpts"]
         if shown:
             st.markdown(f"**Verified excerpts** "
                         f"<span class='tw-badge'>{len(shown)}</span>",
@@ -377,11 +355,12 @@ def main() -> None:
         return
 
     run = runs[labels.index(choice)] if choice in labels else runs[0]
-    claims = run.get("claims", [])
+    # Assessed once, here, so every pane draws from the checked record.
+    claims, flags = assess(run.get("claims", []))
 
     header(run)
     st.divider()
-    review_queue(claims)
+    review_queue(claims, flags)
     st.divider()
     summary_strip(claims)
     st.markdown("")
@@ -389,7 +368,7 @@ def main() -> None:
     st.divider()
     st.markdown("#### Claim detail")
     for c in claims:
-        claim_panel(c)
+        claim_panel(c, flags)
 
 
 if __name__ == "__main__":

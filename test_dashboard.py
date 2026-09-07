@@ -50,6 +50,13 @@ LEAKED = ('Growth remains healthy and nothing material changed.</reasoning>\n'
           '"text":"LEAKED_QUOTE_NEVER_VERIFIED"}]')
 
 
+class StubCtx:
+    """Minimal stand-in for Context; save_run only reads the filing dicts."""
+
+    current = dict(FILING, form="10-Q")
+    prior = dict(FILING, form="10-Q")
+
+
 def claim(**over) -> dict:
     base = {
         "claim_id": "TC-01",
@@ -129,6 +136,11 @@ def check_excerpt_verification(fail) -> int:
     if "1 excerpt," not in out:
         fail("summary card counted unverified excerpts instead of verified ones")
 
+    # Dropping evidence quietly is the failure the gate exists to prevent, so
+    # the drop is itself a review item.
+    if "2 excerpt(s) carried no verification marker" not in out:
+        fail("dropped unverified excerpts without saying so")
+
     # A claim with nothing verified must say so rather than render an empty gap.
     empty = render([claim(excerpts=[
         {"text": "DROPPED_ONLY_QUOTE", "section": "mda", "filing": "current"},
@@ -137,7 +149,7 @@ def check_excerpt_verification(fail) -> int:
         fail("rendered an unverified excerpt when it was the only one")
     if "No excerpt passed verification" not in empty:
         fail("did not state that no excerpt passed verification")
-    return 6
+    return 7
 
 
 def check_truncated_verdict(fail) -> int:
@@ -184,6 +196,44 @@ def check_truncated_verdict(fail) -> int:
     return 9
 
 
+def check_forged_marker_limit(fail) -> int:
+    """A forged verified marker is out of the view's reach; save_run is the line.
+
+    verified=True cannot be re-derived without the filing text, which a consumer
+    reading runs/*.json does not have. So the view renders it, and this asserts
+    that plainly rather than implying a defence that is not there. The half that
+    can be enforced is asserted where it lives: save_run must not write an
+    unmarked excerpt in the first place.
+    """
+    out = render([claim(excerpts=[
+        {"text": "FORGED_MARKER_QUOTE", "section": "mda",
+         "filing": "current", "verified": True},
+    ])])
+    if "FORGED_MARKER_QUOTE" not in out:
+        fail("known limit has changed: a hand-set verified marker is now refused, "
+             "so this test and the note in assess_integrity need rewriting")
+
+    root = Path(tempfile.mkdtemp(prefix="thesiswatch-save-"))
+    keep = thesiswatch.RUNS_DIR
+    thesiswatch.RUNS_DIR = root
+    try:
+        v = thesiswatch.Verdict("TC-01", "s", verdict="unchanged", excerpts=[
+            {"text": "MARKED_AND_KEPT", "section": "mda", "filing": "current",
+             "verified": True},
+            {"text": "UNMARKED_NEVER_PERSISTED", "section": "mda",
+             "filing": "current"},
+        ])
+        written = thesiswatch.save_run("TEST", {"name": "n"}, StubCtx(), [v]).read_text()
+        if "UNMARKED_NEVER_PERSISTED" in written:
+            fail("save_run persisted an excerpt carrying no verification marker")
+        if "MARKED_AND_KEPT" not in written:
+            fail("save_run dropped a verified excerpt")
+    finally:
+        thesiswatch.RUNS_DIR = keep
+        shutil.rmtree(root, ignore_errors=True)
+    return 3
+
+
 def check_empty_review_queue(fail) -> int:
     """The review section renders even with nothing in it.
 
@@ -214,7 +264,7 @@ def main() -> int:
     failures: list[str] = []
     total = 0
     for check in (check_excerpt_verification, check_truncated_verdict,
-                  check_empty_review_queue):
+                  check_forged_marker_limit, check_empty_review_queue):
         before = len(failures)
         total += check(failures.append)
         status = "ok  " if len(failures) == before else "FAIL"
