@@ -1,7 +1,81 @@
 # Notes
 
-Three things worth more than the time it took to fix them. The first two went wrong
-on ADBE; the third is about how the tests for all of it are built.
+## The characteristic failure: a check that exists and never runs
+
+Four bugs so far, and all four are the same bug. Not "the check was wrong" — in every
+case the check was correct and would have caught the problem had it been handed the
+data. What failed was upstream of it.
+
+1. **The tool call was mis-serialized.** Three excerpts were absorbed into the
+   reasoning string and never became `excerpts`, so `verify()` was never called on
+   them. They reached the report as raw JSON inside the prose: quotes presented as
+   analysis with no gate applied.
+2. **The view rendered reasoning without stripping it.** `build_report` ran
+   `strip_markup`; the dashboard didn't. Same leaked structure, same unverified
+   quotes, now on a web page rather than in a markdown file.
+3. **The dashboard trusted the persisted record.** The summary card counted every
+   excerpt in the file instead of the verified ones, so a card could read "3
+   excerpts" above one rendered quote. And with the judgement implemented twice, the
+   report kept printing `**unchanged**` for a claim the dashboard had downgraded.
+4. **pytest collected nothing.** 58 assertions across two files, none named `test_*`,
+   so `pytest` exited having run none of them. The suite that catches items 1–3 would
+   not have run in CI.
+
+The shape they share is that all four fail in the reassuring direction. A gate that
+does not run raises no flags, which is indistinguishable from a gate that ran and
+found nothing. A runner that collects nothing prints no failures. Silence is the same
+output as success, so the system reports health at exactly the moment it stops
+checking.
+
+### The defence is counting
+
+The answer isn't more checks. It's asserting that work *happened*, not merely that
+nothing failed. The cleanest statement of it here is two lines:
+
+```python
+cases = check(failures.append)
+assert cases, f"{check.__name__} ran no cases"
+assert not failures, ...
+```
+
+The second assertion is the one everyone writes. The first is the one that matters: a
+check that stopped asserting and a check that passed are indistinguishable from
+outside unless you count. The same principle now sits wherever this system could go
+quiet.
+
+- CI runs both suites a second time as scripts, because their output states `33/33`
+  and `25/25`. A single-step job is tidier, but the case count in the log is the
+  specific thing that would catch a fifth recurrence, and the job takes under two
+  seconds.
+- `assess_integrity` reports how many excerpts it dropped rather than dropping them
+  quietly.
+- The summary card counts what is actually rendered beneath it, so the card and the
+  body cannot disagree.
+- `verify()` names the excerpt it rejected. The first version appended an
+  unconditional ellipsis, which read as though the excerpt itself ended in one —
+  which is how §2 stayed hidden as long as it did.
+
+### Verifying that the tests have teeth
+
+A test that has never failed is a claim, not evidence. So each assertion was checked
+by breaking the thing it defends and confirming the suite goes red: every fix
+reverted in turn on scratch copies of the source, plus `is_verbatim` mutated to
+`return True`, which reduces the verification gate to a pass-through. Seven of the
+eight tests have now been observed failing under a mutation aimed at what they
+defend. The eighth pins a known limit rather than a defence — see §3 — so there is
+nothing to break in it.
+
+The harness then produced the pattern a fifth time, one level up. Its first run
+reported four of six reverts as MISSED, and the reverts were correct: `thesiswatch`
+was already in `sys.modules`, so editing the file on disk changed nothing and the
+code under test was the unmodified code. A mutation check that fails to mutate looks
+exactly like a suite with holes in it, and it too fails in the reassuring direction.
+Each variant now runs in a fresh interpreter.
+
+---
+
+The three entries below are the individual cases. The first two went wrong on ADBE;
+the third is about how the tests for all of it are built.
 
 ## 1. The same filings produced two different verdicts
 
