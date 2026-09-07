@@ -1,0 +1,21 @@
+ticker: ADBE
+name: Adobe — software mix / margin thesis
+claims:
+  - id: TC-01
+    statement: "Revenue growth remains above 9% year over year"
+    type: quantitative
+    bindings:
+      - tag: Revenues
+        direction: increasing
+        threshold: ">= 9% YoY"
+    falsifiers:
+      - "YoY revenue growth below 9% for two consecutive quarters"
+    sections: [mda, financials]
+  - id: TC-02
+    statement: "Competitive pressure from generative AI entrants is not yet
+      material to the risk profile"
+    type: qualitative
+    falsifiers:
+      - "New or expanded risk factor naming AI competitors"
+      - "Management attributes pricing pressure to AI substitutes"
+    sections: [risk_factors, mda]

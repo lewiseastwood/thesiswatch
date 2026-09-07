@@ -1,0 +1,38 @@
+ticker: CRM
+name: Salesforce — subscription growth / AI competition thesis
+claims:
+  # The 8% threshold is a judgement call, not a fact. It sits a little under the
+  # ~10.8% the last two quarters printed, so it asks "is growth still healthy",
+  # not "is growth still accelerating". Move it if that is not the question.
+  - id: TC-01
+    statement: "Subscription and support revenue growth remains at or above 8%
+      year over year, and subscription — not professional services — is what
+      carries the total"
+    type: quantitative
+    # CRM stopped tagging `Revenues` after FY2016; the live concept is
+    # RevenueFromContractWithCustomerExcludingAssessedTax. That is TOTAL
+    # revenue — subscription-and-support is only tagged with a product/service
+    # dimension, which the companyconcept API does not return. Subscription is
+    # the large majority of the total, so treat this as a proxy and have the
+    # agent confirm the subscription split from mda/financials text.
+    bindings:
+      - tag: RevenueFromContractWithCustomerExcludingAssessedTax
+        direction: increasing
+        threshold: ">= 8% YoY"
+    falsifiers:
+      - "Total revenue YoY growth below 8% for two consecutive quarters"
+      - "Subscription and support revenue growth decelerating while
+        professional services carries the total"
+      - "Management guides to subscription growth below the threshold"
+    sections: [mda, financials]
+
+  - id: TC-02
+    statement: "Competitive and AI-related risk language has not materially
+      expanded relative to the prior filing"
+    type: qualitative
+    falsifiers:
+      - "New or expanded risk factor naming AI competitors or agentic AI
+        substitutes"
+      - "Management attributes pricing pressure, longer sales cycles, or
+        customer attrition to AI competition"
+    sections: [risk_factors, mda]

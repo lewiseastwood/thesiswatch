@@ -12,6 +12,7 @@ Analyst-support tool. Does not produce buy/sell recommendations.
 
 import json, re, time, html, difflib, hashlib
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -179,29 +180,19 @@ def diff_summary(old: str, new: str, max_blocks: int = 40) -> str:
 
 
 # ------------------------------------------------------------- thesis
-THESIS_YAML = """
-ticker: ADBE
-name: Adobe — software mix / margin thesis
-claims:
-  - id: TC-01
-    statement: "Revenue growth remains above 9% year over year"
-    type: quantitative
-    bindings:
-      - tag: Revenues
-        direction: increasing
-        threshold: ">= 9% YoY"
-    falsifiers:
-      - "YoY revenue growth below 9% for two consecutive quarters"
-    sections: [mda, financials]
-  - id: TC-02
-    statement: "Competitive pressure from generative AI entrants is not yet
-      material to the risk profile"
-    type: qualitative
-    falsifiers:
-      - "New or expanded risk factor naming AI competitors"
-      - "Management attributes pricing pressure to AI substitutes"
-    sections: [risk_factors, mda]
-"""
+THESES_DIR = Path(__file__).parent / "theses"
+
+
+def load_thesis(ticker: str) -> dict:
+    """Load the thesis for one ticker from theses/{TICKER}.yaml."""
+    path = THESES_DIR / f"{ticker.upper()}.yaml"
+    if not path.is_file():
+        available = sorted(p.stem for p in THESES_DIR.glob("*.yaml"))
+        raise FileNotFoundError(
+            f"No thesis for {ticker.upper()!r} at {path}. "
+            f"Available: {', '.join(available) or '(none)'}"
+        )
+    return yaml.safe_load(path.read_text())
 
 
 @dataclass

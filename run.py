@@ -1,27 +1,34 @@
-"""Run ThesisWatch against Adobe's two most recent 10-Q filings.
+"""Run ThesisWatch against a company's two most recent 10-Q filings.
 
-    python run.py
+    python run.py            # defaults to ADBE
+    python run.py MSFT       # needs theses/MSFT.yaml
 
 Analyst-support tool. Does not produce buy/sell recommendations.
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
 
 import anthropic
-import yaml
 from dotenv import load_dotenv
 
 import thesiswatch
-from thesiswatch import THESIS_YAML, Context, Edgar, build_report, evaluate_claim
+from thesiswatch import Context, Edgar, build_report, evaluate_claim, load_thesis
 
-TICKER = "ADBE"
+DEFAULT_TICKER = "ADBE"
 FORM = "10-Q"
 OUT = Path(__file__).parent / "report.md"
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("ticker", nargs="?", default=DEFAULT_TICKER,
+                        help=f"ticker with a thesis in theses/ (default: {DEFAULT_TICKER})")
+    ticker = parser.parse_args().ticker.upper()
+
     load_dotenv()
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -38,16 +45,22 @@ def main() -> int:
     thesiswatch.SEC_UA = f"ThesisWatch research/0.1 ({email})"
     thesiswatch.MODEL = os.getenv("THESISWATCH_MODEL", "").strip() or thesiswatch.MODEL
 
+    try:
+        thesis = load_thesis(ticker)
+    except FileNotFoundError as e:
+        print(e, file=sys.stderr)
+        return 1
+
     edgar = Edgar(thesiswatch.SEC_UA)
-    cik = edgar.cik(TICKER)
+    cik = edgar.cik(ticker)
     filings = edgar.filings(cik, FORM, limit=2)
     if len(filings) < 2:
         print(f"Need two {FORM} filings to diff; EDGAR returned {len(filings)} "
-              f"for {TICKER}.", file=sys.stderr)
+              f"for {ticker}.", file=sys.stderr)
         return 1
 
     current, prior = filings[0], filings[1]
-    print(f"{TICKER} CIK {cik}")
+    print(f"{ticker} CIK {cik}")
     print(f"  current: {FORM} filed {current['filingDate']} (period {current['reportDate']})")
     print(f"  prior:   {FORM} filed {prior['filingDate']} (period {prior['reportDate']})")
 
@@ -56,7 +69,6 @@ def main() -> int:
     for which, sections in ctx.sections.items():
         print(f"  {which}: {sorted(sections)}")
 
-    thesis = yaml.safe_load(THESIS_YAML)
     client = anthropic.Anthropic(api_key=api_key)
 
     verdicts = []
