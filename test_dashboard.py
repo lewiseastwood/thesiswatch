@@ -260,11 +260,40 @@ def check_empty_review_queue(fail) -> int:
     return 6
 
 
+CHECKS = (check_excerpt_verification, check_truncated_verdict,
+          check_forged_marker_limit, check_empty_review_queue)
+
+
+# ------------------------------------------------------ pytest entry points
+# See the note in test_verify.py: without a test_* name pytest collects nothing
+# from this file, so a CI step running pytest would pass having rendered nothing.
+def _under_pytest(check) -> None:
+    failures: list[str] = []
+    cases = check(failures.append)
+    assert cases, f"{check.__name__} ran no cases"
+    assert not failures, f"{len(failures)} failed: " + "; ".join(failures)
+
+
+def test_only_verified_excerpts_are_rendered():
+    _under_pytest(check_excerpt_verification)
+
+
+def test_truncated_verdict_is_not_presentable():
+    _under_pytest(check_truncated_verdict)
+
+
+def test_forged_verification_marker_is_a_known_limit():
+    _under_pytest(check_forged_marker_limit)
+
+
+def test_review_queue_renders_when_empty():
+    _under_pytest(check_empty_review_queue)
+
+
 def main() -> int:
     failures: list[str] = []
     total = 0
-    for check in (check_excerpt_verification, check_truncated_verdict,
-                  check_forged_marker_limit, check_empty_review_queue):
+    for check in CHECKS:
         before = len(failures)
         total += check(failures.append)
         status = "ok  " if len(failures) == before else "FAIL"

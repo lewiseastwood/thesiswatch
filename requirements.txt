@@ -10,3 +10,6 @@ requests==2.34.2
 # app.py through streamlit's AppTest, so both are required to run the suites.
 plotly==7.0.0
 streamlit==1.63.0
+
+# Test runner. Both suites also run standalone as plain scripts.
+pytest==9.1.1

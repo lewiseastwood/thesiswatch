@@ -2,9 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -20,14 +18,20 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Neither suite reaches the network or reads a credential. The gate tests
-      # are pure functions over string fixtures; the dashboard tests render
-      # app.py against hand-built run files with THESES_DIR and RUNS_DIR pointed
-      # at temp dirs, so the thesis binds no XBRL metric and no EDGAR call is
-      # made. A suite that needed an API key could not run here at all, which is
-      # the reason for keeping the fixtures synthetic.
-      - name: Verification gate
-        run: python test_verify.py
+      # No API key and no network. The gate tests are pure functions over string
+      # fixtures; the dashboard tests render app.py through streamlit's AppTest
+      # with THESES_DIR and RUNS_DIR pointed at temp dirs, using a thesis that
+      # binds no XBRL metric, so nothing reaches EDGAR. Verified locally with
+      # ANTHROPIC_API_KEY and SEC_UA_EMAIL unset.
+      - name: pytest
+        run: pytest -v
 
-      - name: Dashboard rendering invariants
-        run: python test_dashboard.py
+      # Both suites also run standalone, and their output states how many cases
+      # ran ("33/33", "25/25"). That number is the point: pytest collected zero
+      # tests from these files until the test_* wrappers were added, and a
+      # runner that silently collects nothing still reports success. Keeping the
+      # explicit totals in the log makes an empty run visible rather than green.
+      - name: Case counts
+        run: |
+          python test_verify.py
+          python test_dashboard.py

@@ -113,7 +113,25 @@ PRIOR_ONLY = ("We face competition from companies offering generative artificial
               "intelligence solutions, and expect that competition to intensify")
 
 
-def check_labels(failures: list[str]) -> int:
+def check_keep(fail) -> int:
+    """A quote the filing really contains survives however it was punctuated."""
+    hay = norm(FILING)
+    for label, excerpt in KEEP.items():
+        if not is_verbatim(excerpt, hay):
+            fail(f"should have been kept, was dropped: {label}")
+    return len(KEEP)
+
+
+def check_drop(fail) -> int:
+    """A quote the filing does not contain is dropped."""
+    hay = norm(FILING)
+    for label, excerpt in DROP.items():
+        if is_verbatim(excerpt, hay):
+            fail(f"should have been dropped, was kept: {label}")
+    return len(DROP)
+
+
+def check_labels(fail) -> int:
     """An excerpt is checked against the filing it claims to come from.
 
     The risk factor is reworded between the two fixtures, so quoting the prior
@@ -134,12 +152,11 @@ def check_labels(failures: list[str]) -> int:
                                              "filing": filing}])
         kept = bool(verify(v, ctx).excerpts)
         if kept != should_keep:
-            failures.append(
-                f"filing label {'dropped' if should_keep else 'kept'} wrongly: {label}")
+            fail(f"filing label {'dropped' if should_keep else 'kept'} wrongly: {label}")
     return len(cases)
 
 
-def check_payloads(failures: list[str]) -> int:
+def check_payloads(fail) -> int:
     """A partial or mis-serialized verdict payload must be refused, not rendered.
 
     The observed failure came back with stop_reason "tool_use" and every key
@@ -159,8 +176,8 @@ def check_payloads(failures: list[str]) -> int:
     for label, payload, stop_reason, should_reject in cases:
         rejected = bool(validate_payload(Verdict("TC-01", "s"), payload, stop_reason))
         if rejected != should_reject:
-            failures.append(
-                f"payload {'accepted' if should_reject else 'refused'} wrongly: {label}")
+            fail(f"payload {'accepted' if should_reject else 'refused'} "
+                 f"wrongly: {label}")
 
     # Rendering is the last line of defence: leaked markup must never reach the
     # page, and the claim must be flagged rather than read as clean analysis.
@@ -173,34 +190,56 @@ def check_payloads(failures: list[str]) -> int:
 
     report = build_report(C(), {"ticker": "T", "name": "n"}, [v])
     if "<parameter" in report or "</reasoning>" in report:
-        failures.append("build_report rendered raw tool-call markup")
+        fail("build_report rendered raw tool-call markup")
     if "Subscription and support $ 10,820" in report:
-        failures.append("build_report rendered an unverified excerpt from leaked markup")
+        fail("build_report rendered an unverified excerpt from leaked markup")
     if "never verified" not in report:
-        failures.append("build_report did not flag the claim whose reasoning leaked")
+        fail("build_report did not flag the claim whose reasoning leaked")
     # The report and the dashboard now share assess_integrity, so they cannot
     # disagree about this. Before they did: the report went on printing
     # "**unchanged**" for a claim the dashboard had already downgraded.
     if "**unchanged**" in report:
-        failures.append("build_report presented a leaked-payload claim under its "
-                        "recorded verdict")
+        fail("build_report presented a leaked-payload claim under its "
+             "recorded verdict")
     if "**insufficient_evidence**" not in report:
-        failures.append("build_report did not downgrade a leaked-payload claim")
+        fail("build_report did not downgrade a leaked-payload claim")
     return len(cases) + 5
 
 
-def main() -> int:
-    hay = norm(FILING)
+CHECKS = (check_keep, check_drop, check_labels, check_payloads)
+
+
+# ------------------------------------------------------ pytest entry points
+# This suite predates pytest and still runs standalone. The wrappers exist so
+# pytest collects it too: with no test_* name in the file, `pytest` collects
+# nothing here and a CI step calling it asserts nothing at all -- the same
+# silent no-op as a gate that does not run.
+def _under_pytest(check) -> None:
     failures: list[str] = []
+    cases = check(failures.append)
+    assert cases, f"{check.__name__} ran no cases"
+    assert not failures, f"{len(failures)} failed: " + "; ".join(failures)
 
-    for label, excerpt in KEEP.items():
-        if not is_verbatim(excerpt, hay):
-            failures.append(f"should have been kept, was dropped: {label}")
-    for label, excerpt in DROP.items():
-        if is_verbatim(excerpt, hay):
-            failures.append(f"should have been dropped, was kept: {label}")
 
-    total = len(KEEP) + len(DROP) + check_labels(failures) + check_payloads(failures)
+def test_faithful_quotes_survive():
+    _under_pytest(check_keep)
+
+
+def test_fabricated_quotes_are_dropped():
+    _under_pytest(check_drop)
+
+
+def test_excerpts_are_checked_against_the_filing_they_claim():
+    _under_pytest(check_labels)
+
+
+def test_mis_serialized_payloads_are_refused():
+    _under_pytest(check_payloads)
+
+
+def main() -> int:
+    failures: list[str] = []
+    total = sum(check(failures.append) for check in CHECKS)
     for f in failures:
         print(f"FAIL  {f}")
     print(f"{total - len(failures)}/{total} gate cases behaved "
